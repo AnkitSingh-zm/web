@@ -95,10 +95,19 @@ class GrantType(SuperModel):
 
     name = models.CharField(unique=True, max_length=15, help_text="Grant Type")
     label = models.CharField(max_length=25, null=True, help_text="Display Name")
+    is_active = models.BooleanField(default=True, db_index=True, help_text="Is Grant Type currently active")
     categories  = models.ManyToManyField(
         GrantCategory,
         help_text="Grant Categories associated with Grant Type"
     )
+    logo = models.ImageField(
+        upload_to=get_upload_filename,
+        null=True,
+        blank=True,
+        max_length=500,
+        help_text=_('The default category\'s marketing banner (aspect ratio = 10:3)'),
+    )
+
 
     def __str__(self):
         """Return the string representation."""
@@ -132,6 +141,11 @@ class GrantCLR(SuperModel):
         null=True, blank=True,
         help_text="Grant Subscription to be allowed in this CLR round"
     )
+    collection_filters = JSONField(
+        default=dict,
+        null=True, blank=True,
+        help_text="Grant Collections to be allowed in this CLR round"
+    )
     verified_threshold = models.DecimalField(help_text="Verfied CLR Threshold",
         default=25.0,
         decimal_places=2,
@@ -153,7 +167,6 @@ class GrantCLR(SuperModel):
         decimal_places=4,
         max_digits=10,
     )
-
     logo = models.ImageField(
         upload_to=get_upload_filename,
         null=True,
@@ -405,6 +418,27 @@ class Grant(SuperModel):
         """Return the string representation of a Grant."""
         return f"id: {self.pk}, active: {self.active}, title: {self.title}, type: {self.grant_type}"
 
+    def calc_clr_round(self):
+        clr_round = None
+
+        # create_grant_active_clr_mapping
+        clr_rounds = GrantCLR.objects.filter(is_active=True)
+        for this_clr_round in clr_rounds:
+            if self in this_clr_round.grants:
+                self.in_active_clrs.add(this_clr_round)
+            else:
+                self.in_active_clrs.remove(this_clr_round)
+
+        # create_grant_clr_cache
+        if self.in_active_clrs.count() > 0 and self.is_clr_eligible:
+            clr_round = self.in_active_clrs.first()
+
+        if clr_round:
+            self.is_clr_active = True
+            self.clr_round_num = clr_round.round_num
+        else:
+            self.is_clr_active = False
+            self.clr_round_num = ''
 
     @property
     def tenants(self):
@@ -658,6 +692,19 @@ class Grant(SuperModel):
 
     def favorite(self, user):
         return Favorite.objects.filter(user=user, grant=self).exists()
+
+    def save(self, update=True, *args, **kwargs):
+        """Override the Grant save to optionally handle modified_on logic."""
+        if self.modified_on < (timezone.now() - timezone.timedelta(minutes=15)):
+            from grants.tasks import update_grant_metadata
+            update_grant_metadata.delay(self.pk)
+
+        from economy.models import get_time
+        if update:
+            self.modified_on = get_time()
+
+        return super(Grant, self).save(*args, **kwargs)
+
 
 class SubscriptionQuerySet(models.QuerySet):
     """Define the Subscription default queryset and manager."""
@@ -1092,7 +1139,6 @@ next_valid_timestamp: {next_valid_timestamp}
 
         return result
 
-
     def save_split_tx_to_contribution(self):
         sc = self.subscription_contribution.first()
         sc.split_tx_id = self.split_tx_id
@@ -1181,11 +1227,6 @@ next_valid_timestamp: {next_valid_timestamp}
         return contribution
 
 
-@receiver(pre_save, sender=Grant, dispatch_uid="psave_grant")
-def psave_grant(sender, instance, **kwargs):
-    if instance.modified_on < (timezone.now() - timezone.timedelta(minutes=15)):
-        from grants.tasks import update_grant_metadata
-        update_grant_metadata.delay(instance.pk)
 
 class DonationQuerySet(models.QuerySet):
     """Define the Contribution default queryset and manager."""
@@ -1788,7 +1829,7 @@ class MatchPledge(SuperModel):
         max_digits=50,
         help_text=_('The matching pledge amount in DAI.'),
     )
-    pledge_type = models.CharField(max_length=15, choices=PLEDGE_TYPES, default='tech', help_text=_('CLR pledge type'))
+    pledge_type = models.CharField(max_length=15, null=True, blank=True, choices=PLEDGE_TYPES, help_text=_('CLR pledge type'))
     comments = models.TextField(default='', blank=True, help_text=_('The comments.'))
     end_date = models.DateTimeField(null=False, default=next_month)
     data = JSONField(null=True, blank=True)
